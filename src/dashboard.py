@@ -38,6 +38,7 @@ UPDATE = None
 app = Flask("WGDashboard", template_folder=os.path.abspath("./static/app/dist"))
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 5206928
 app.secret_key = secrets.token_urlsafe(32)
+WireguardConfigurationsLock = threading.RLock()
 
 class ModelEncoder(JSONEncoder):
     def default(self, o: Any) -> Any:
@@ -447,6 +448,7 @@ class WireguardConfiguration:
         self.__parser: configparser.ConfigParser = configparser.ConfigParser(strict=False)
         self.__parser.optionxform = str
         self.__configFileModifiedTime = None
+        self._peers_lock = threading.RLock()
         
         self.Status: bool = False
         self.Name: str = ""
@@ -640,21 +642,30 @@ class WireguardConfiguration:
         return self.Name in d
 
     def __getRestrictedPeers(self):
-        self.RestrictedPeers = []
+        restricted_peers = []
         restricted = sqlSelect("SELECT * FROM '%s_restrict_access'" % self.Name).fetchall()
         for i in restricted:
-            self.RestrictedPeers.append(Peer(i, self))
+            restricted_peers.append(Peer(i, self))
+        with self._peers_lock:
+            self.RestrictedPeers = restricted_peers
             
     def configurationFileChanged(self) :
         mt = os.path.getmtime(os.path.join(DashboardConfig.GetConfig("Server", "wg_conf_path")[1], f'{self.Name}.conf'))
-        changed = self.__configFileModifiedTime is None or self.__configFileModifiedTime != mt
-        self.__configFileModifiedTime = mt
-        return changed
+        with self._peers_lock:
+            changed = self.__configFileModifiedTime is None or self.__configFileModifiedTime != mt
+            self.__configFileModifiedTime = mt
+            return changed
         
     def __getPeers(self):
-        if self.configurationFileChanged():
-            self.Peers = []
-            with open(os.path.join(DashboardConfig.GetConfig("Server", "wg_conf_path")[1], f'{self.Name}.conf'), 'r') as configFile:
+        config_path = os.path.join(DashboardConfig.GetConfig("Server", "wg_conf_path")[1], f'{self.Name}.conf')
+        file_mtime = os.path.getmtime(config_path)
+        with self._peers_lock:
+            last_mtime = self.__configFileModifiedTime
+        changed = last_mtime is None or last_mtime != file_mtime
+
+        new_peers = []
+        if changed:
+            with open(config_path, 'r') as configFile:
                 p = []
                 pCounter = -1
                 content = configFile.read().split('\n')
@@ -714,19 +725,22 @@ class WireguardConfiguration:
                                         :cumu_data, :mtu, :keepalive, :remote_endpoint, :preshared_key);
                                     """ % self.Name
                                     , newPeer)
-                                self.Peers.append(Peer(newPeer, self))
+                                new_peers.append(Peer(newPeer, self))
                             else:
                                 sqlUpdate("UPDATE '%s' SET allowed_ip = ? WHERE id = ?" % self.Name,
                                                (i.get("AllowedIPs", "N/A"), i['PublicKey'],))
-                                self.Peers.append(Peer(checkIfExist, self))
+                                new_peers.append(Peer(checkIfExist, self))
                 except Exception as e:
                     if __name__ == '__main__':
                         print(f"[WGDashboard] {self.Name} Error: {str(e)}")
         else:
-            self.Peers.clear()
             checkIfExist = sqlSelect("SELECT * FROM '%s'" % self.Name).fetchall()
             for i in checkIfExist:
-                self.Peers.append(Peer(i, self))
+                new_peers.append(Peer(i, self))
+
+        with self._peers_lock:
+            self.__configFileModifiedTime = file_mtime
+            self.Peers = new_peers
             
     def addPeers(self, peers: list):
         try:
@@ -997,11 +1011,13 @@ class WireguardConfiguration:
 
     def getPeersList(self):
         self.__getPeers()
-        return self.Peers
+        with self._peers_lock:
+            return list(self.Peers)
 
     def getRestrictedPeersList(self) -> list:
         self.__getRestrictedPeers()
-        return self.RestrictedPeers
+        with self._peers_lock:
+            return list(self.RestrictedPeers)
 
     def toJson(self):
         self.Status = self.getStatus()
@@ -1527,17 +1543,18 @@ def _regexMatch(regex, text):
 def _getConfigurationList(startup: bool = False):
     confs = os.listdir(DashboardConfig.GetConfig("Server", "wg_conf_path")[1])
     confs.sort()
-    for i in confs:
-        if _regexMatch("^(.{1,}).(conf)$", i):
-            i = i.replace('.conf', '')
-            try:
-                if i in WireguardConfigurations.keys():
-                    if WireguardConfigurations[i].configurationFileChanged():
-                        WireguardConfigurations[i] = WireguardConfiguration(i)
-                else:
-                    WireguardConfigurations[i] = WireguardConfiguration(i, startup=startup)
-            except WireguardConfiguration.InvalidConfigurationFileException as e:
-                print(f"{i} have an invalid configuration file.")
+    with WireguardConfigurationsLock:
+        for i in confs:
+            if _regexMatch("^(.{1,}).(conf)$", i):
+                i = i.replace('.conf', '')
+                try:
+                    if i in WireguardConfigurations.keys():
+                        if WireguardConfigurations[i].configurationFileChanged():
+                            WireguardConfigurations[i] = WireguardConfiguration(i)
+                    else:
+                        WireguardConfigurations[i] = WireguardConfiguration(i, startup=startup)
+                except WireguardConfiguration.InvalidConfigurationFileException as e:
+                    print(f"{i} have an invalid configuration file.")
     
 def _checkIPWithRange(ip):
     ip_patterns = (
@@ -2265,12 +2282,14 @@ def API_getAvailableIPs(configName):
 @app.get(f'{APP_PREFIX}/api/getWireguardConfigurationInfo')
 def API_getConfigurationInfo():
     configurationName = request.args.get("configurationName")
-    if not configurationName or configurationName not in WireguardConfigurations.keys():
+    with WireguardConfigurationsLock:
+        configuration = WireguardConfigurations.get(configurationName)
+    if not configurationName or configuration is None:
         return ResponseObject(False, "Please provide configuration name")
     return ResponseObject(data={
-        "configurationInfo": WireguardConfigurations[configurationName],
-        "configurationPeers": WireguardConfigurations[configurationName].getPeersList(),
-        "configurationRestrictedPeers": WireguardConfigurations[configurationName].getRestrictedPeersList()
+        "configurationInfo": configuration,
+        "configurationPeers": configuration.getPeersList(),
+        "configurationRestrictedPeers": configuration.getRestrictedPeersList()
     })
 
 @app.get(f'{APP_PREFIX}/api/getDashboardTheme')
@@ -2569,7 +2588,9 @@ def backGroundThread():
     time.sleep(10)
     while True:
         with app.app_context():
-            for c in WireguardConfigurations.values():
+            with WireguardConfigurationsLock:
+                configs_snapshot = list(WireguardConfigurations.values())
+            for c in configs_snapshot:
                 if c.getStatus():
                     try:
                         c.getPeersTransfer()
