@@ -69,7 +69,11 @@ export const WireguardConfigurationsStore = defineStore('WireguardConfigurations
 	actions: {
 		async getConfigurations(){
 			await fetchGet("/api/getWireguardConfigurations", {}, (res) => {
-				if (res.status)  this.Configurations = res.data
+				if (res.status) {
+					this.Configurations = res.data.sort((a, b) =>
+						a.Name.localeCompare(b.Name, undefined, {numeric: true, sensitivity: "base"})
+					);
+				}
 				// this.Configurations = []
 			});
 		},
