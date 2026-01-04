@@ -4,7 +4,7 @@ WireGuard Configuration
 from typing import Any
 
 import jinja2
-import sqlalchemy, random, shutil, configparser, ipaddress, os, subprocess, time, re, uuid, psutil, traceback
+import sqlalchemy, random, shutil, configparser, ipaddress, os, subprocess, time, re, uuid, psutil, threading, traceback
 from zipfile import ZipFile
 from datetime import datetime, timedelta
 from itertools import islice
@@ -43,6 +43,8 @@ class WireguardConfiguration:
         self.__parser: configparser.ConfigParser = configparser.RawConfigParser(strict=False)
         self.__parser.optionxform = str
         self.__configFileModifiedTime = None
+        self._peers_lock = threading.RLock()
+        self.RestrictedPeers = []
         self.Status: bool = False
         self.Name: str = ""
         self.PrivateKey: str = ""
@@ -382,21 +384,29 @@ class WireguardConfiguration:
             self.DashboardConfig.SetConfig("WireGuardConfiguration", "autostart", d)
 
     def getRestrictedPeers(self):
-        self.RestrictedPeers = []
+        restricted_peers = []
         with self.engine.connect() as conn:
             restricted = conn.execute(self.peersRestrictedTable.select()).mappings().fetchall()
             for i in restricted:
-                self.RestrictedPeers.append(Peer(i, self))
+                restricted_peers.append(Peer(i, self))
+        with self._peers_lock:
+            self.RestrictedPeers = restricted_peers
 
     def configurationFileChanged(self) :
         mt = os.path.getmtime(self.configPath)
-        changed = self.__configFileModifiedTime is None or self.__configFileModifiedTime != mt
-        self.__configFileModifiedTime = mt
-        return changed
+        with self._peers_lock:
+            changed = self.__configFileModifiedTime is None or self.__configFileModifiedTime != mt
+            self.__configFileModifiedTime = mt
+            return changed
 
     def getPeers(self):
-        tmpList = []        
-        if self.configurationFileChanged():
+        config_mtime = os.path.getmtime(self.configPath)
+        with self._peers_lock:
+            last_mtime = self.__configFileModifiedTime
+        changed = last_mtime is None or last_mtime != config_mtime
+
+        tmpList = []
+        if changed:
             with open(self.configPath, 'r') as configFile:
                 p = []
                 pCounter = -1
@@ -478,7 +488,9 @@ class WireguardConfiguration:
                 existingPeers = conn.execute(self.peersTable.select()).mappings().fetchall()
                 for i in existingPeers:
                     tmpList.append(Peer(i, self))
-        self.Peers = tmpList
+        with self._peers_lock:
+            self.__configFileModifiedTime = config_mtime
+            self.Peers = tmpList
     
     def logPeersTraffic(self):
         with self.engine.begin() as conn:
@@ -863,11 +875,13 @@ class WireguardConfiguration:
         return True, None
 
     def getPeersList(self):
-        return self.Peers
+        with self._peers_lock:
+            return list(self.Peers)
 
     def getRestrictedPeersList(self) -> list:
         self.getRestrictedPeers()
-        return self.RestrictedPeers
+        with self._peers_lock:
+            return list(self.RestrictedPeers)
 
     def toJson(self):
         self.Status = self.getStatus()
