@@ -88,14 +88,26 @@ export const WireguardConfigurationsStore = defineStore('WireguardConfigurations
 	}),
     getters: {
         sortConfigurations(){
+            const collator = new Intl.Collator(undefined, {numeric: true, sensitivity: "base"});
             return [...this.Configurations].sort((a, b) => {
-                if (this.CurrentSort.order === 'desc') {
-                    return this.dotNotation(a, this.CurrentSort.key) < this.dotNotation(b, this.CurrentSort.key) ?
-                        1 : this.dotNotation(a, this.CurrentSort.key) > this.dotNotation(b, this.CurrentSort.key) ? -1 : 0;
-                } else {
-                    return this.dotNotation(a, this.CurrentSort.key) > this.dotNotation(b, this.CurrentSort.key) ?
-                        1 : this.dotNotation(a, this.CurrentSort.key) < this.dotNotation(b, this.CurrentSort.key) ? -1 : 0;
+                const av = this.dotNotation(a, this.CurrentSort.key);
+                const bv = this.dotNotation(b, this.CurrentSort.key);
+                const order = this.CurrentSort.order;
+
+                if (typeof av === "string" && typeof bv === "string") {
+                    const cmp = collator.compare(av, bv);
+                    return order === "desc" ? -cmp : cmp;
                 }
+
+                if (av == null && bv == null) return 0;
+                if (av == null) return order === "desc" ? 1 : -1;
+                if (bv == null) return order === "desc" ? -1 : 1;
+                if (av === bv) return 0;
+
+                if (order === "desc") {
+                    return av < bv ? 1 : -1;
+                }
+                return av > bv ? 1 : -1;
             })
         },
     },
